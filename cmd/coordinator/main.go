@@ -28,16 +28,18 @@ type CoordinatorService struct {
     retryCount      map[string]int
     taskAssignments map[string]string // taskID -> workerID
     mu             sync.Mutex
+    verbose        bool
 }
 
 // NewCoordinator creates a new coordinator instance
-func NewCoordinator() *CoordinatorService {
+func NewCoordinator(verbose bool) *CoordinatorService {
     c := &CoordinatorService{
         tasks:           make(map[string]*types.Task),
         workers:         make(map[string]*types.WorkerStatus),
         taskQueue:       make([]string, 0),
         retryCount:      make(map[string]int),
         taskAssignments: make(map[string]string),
+        verbose:         verbose,
     }
     go c.processTaskQueue()
     go c.monitorWorkerHealth()
@@ -50,7 +52,13 @@ func (c *CoordinatorService) RegisterWorker(status *types.WorkerStatus, reply *b
     defer c.mu.Unlock()
 
     c.workers[status.ID] = status
-    log.Printf("Worker %s registered\n", status.ID)
+    log.Printf("[INFO] Worker %s registered successfully\n", status.ID)
+    if c.verbose {
+        log.Printf("[DEBUG] Total workers registered: %d\n", len(c.workers))
+        for id := range c.workers {
+            log.Printf("[DEBUG] - Worker %s is registered\n", id)
+        }
+    }
     *reply = true
     return nil
 }
@@ -59,6 +67,19 @@ func (c *CoordinatorService) RegisterWorker(status *types.WorkerStatus, reply *b
 func (c *CoordinatorService) SubmitTask(req *types.ComputeRequest, resp *types.ComputeResponse) error {
     c.mu.Lock()
     defer c.mu.Unlock()
+
+    if c.verbose {
+        log.Printf("[DEBUG] Received task submission: %s\n", req.TaskID)
+        log.Printf("[DEBUG] Number of available workers: %d\n", len(c.workers))
+    }
+
+    // Verify we have workers available
+    if len(c.workers) == 0 {
+        log.Printf("[ERROR] No workers registered to handle task %s\n", req.TaskID)
+        resp.Error = "no workers available"
+        resp.Success = false
+        return nil
+    }
 
     // Create new task
     task := &types.Task{
@@ -72,6 +93,10 @@ func (c *CoordinatorService) SubmitTask(req *types.ComputeRequest, resp *types.C
     // Add to task map and queue
     c.tasks[req.TaskID] = task
     c.taskQueue = append(c.taskQueue, req.TaskID)
+
+    if c.verbose {
+        log.Printf("[DEBUG] Task %s added to queue. Queue length: %d\n", req.TaskID, len(c.taskQueue))
+    }
 
     // Set initial response
     resp.TaskID = req.TaskID
@@ -97,6 +122,11 @@ func (c *CoordinatorService) GetTaskStatus(taskID string, resp *types.ComputeRes
     resp.Success = task.Completed
     resp.Error = task.Error
 
+    if c.verbose {
+        log.Printf("[DEBUG] Status request for task %s: completed=%v, error=%s\n", 
+            taskID, task.Completed, task.Error)
+    }
+
     return nil
 }
 
@@ -109,6 +139,12 @@ func (c *CoordinatorService) UpdateWorkerStatus(status *types.WorkerStatus, repl
         worker.Available = status.Available
         worker.TaskCount = status.TaskCount
         worker.LastUpdated = time.Now().Unix()
+        if c.verbose {
+            log.Printf("[DEBUG] Updated status for worker %s: available=%v, taskCount=%d\n",
+                status.ID, status.Available, status.TaskCount)
+        }
+    } else {
+        log.Printf("[WARN] Received status update from unregistered worker: %s\n", status.ID)
     }
     *reply = true
     return nil
@@ -123,7 +159,7 @@ func (c *CoordinatorService) monitorWorkerHealth() {
 
         for id, worker := range c.workers {
             if now-worker.LastUpdated > int64(workerTimeout.Seconds()) {
-                log.Printf("Worker %s appears to be dead, removing...", id)
+                log.Printf("[WARN] Worker %s appears to be dead, removing...\n", id)
                 delete(c.workers, id)
 
                 // Reassign tasks from failed worker
@@ -133,9 +169,10 @@ func (c *CoordinatorService) monitorWorkerHealth() {
                             c.taskQueue = append(c.taskQueue, taskID)
                             c.retryCount[taskID]++
                             delete(c.taskAssignments, taskID)
-                            log.Printf("Reassigning task %s (attempt %d/%d)", taskID, c.retryCount[taskID], maxRetries)
+                            log.Printf("[INFO] Reassigning task %s (attempt %d/%d)\n", 
+                                taskID, c.retryCount[taskID], maxRetries)
                         } else {
-                            log.Printf("Task %s failed after %d attempts", taskID, maxRetries)
+                            log.Printf("[ERROR] Task %s failed after %d attempts\n", taskID, maxRetries)
                             if task, exists := c.tasks[taskID]; exists {
                                 task.Error = "maximum retry attempts exceeded"
                                 task.Completed = true
@@ -145,6 +182,11 @@ func (c *CoordinatorService) monitorWorkerHealth() {
                 }
             }
         }
+
+        if c.verbose {
+            log.Printf("[DEBUG] Health check complete. Active workers: %d\n", len(c.workers))
+        }
+
         c.mu.Unlock()
     }
 }
@@ -160,12 +202,17 @@ func (c *CoordinatorService) getLeastBusyWorker() *types.WorkerStatus {
             continue
         }
 
-        // Calculate load score based on task count and recent activity
+        // Calculate load score based on task count
         loadScore := float64(worker.TaskCount)
         if selected == nil || loadScore < minLoad {
             selected = worker
             minLoad = loadScore
         }
+    }
+
+    if c.verbose && selected != nil {
+        log.Printf("[DEBUG] Selected worker %s (load: %.2f) for next task\n", 
+            selected.ID, minLoad)
     }
 
     return selected
@@ -176,12 +223,21 @@ func (c *CoordinatorService) processTaskQueue() {
     for {
         c.mu.Lock()
         if len(c.taskQueue) > 0 {
+            if c.verbose {
+                log.Printf("[DEBUG] Processing task queue. Length: %d\n", len(c.taskQueue))
+            }
+
             taskID := c.taskQueue[0]
             if worker := c.getLeastBusyWorker(); worker != nil {
                 task := c.tasks[taskID]
                 c.taskQueue = c.taskQueue[1:]
                 c.taskAssignments[taskID] = worker.ID
+                
+                log.Printf("[INFO] Assigning task %s to worker %s\n", taskID, worker.ID)
+                
                 go c.assignTaskToWorker(task, worker)
+            } else {
+                log.Printf("[WARN] No available workers to process task %s\n", taskID)
             }
         }
         c.mu.Unlock()
@@ -191,26 +247,40 @@ func (c *CoordinatorService) processTaskQueue() {
 
 // assignTaskToWorker sends a task to a worker and handles the response
 func (c *CoordinatorService) assignTaskToWorker(task *types.Task, worker *types.WorkerStatus) {
-    // Create TLS config for worker connection
-    config := &tls.Config{
-        InsecureSkipVerify: true, // For self-signed certificates
+    if c.verbose {
+        log.Printf("[DEBUG] Attempting to connect to worker %s for task %s\n", 
+            worker.ID, task.ID)
     }
 
-    // Connect to worker using TLS
-    conn, err := tls.Dial("tcp", worker.ID, config)
-    if err != nil {
-        log.Printf("Failed to connect to worker %s: %v\n", worker.ID, err)
-        c.handleWorkerFailure(task, worker)
-        return
+    var client *rpc.Client
+    var err error
+
+    // Try to connect to the worker
+    for attempt := 1; attempt <= maxRetries; attempt++ {
+        if c.verbose {
+            log.Printf("[DEBUG] Connection attempt %d to worker %s\n", attempt, worker.ID)
+        }
+
+        client, err = rpc.Dial("tcp", worker.ID)
+        if err == nil {
+            break
+        }
+
+        if attempt == maxRetries {
+            log.Printf("[ERROR] Failed to connect to worker %s after %d attempts: %v\n", 
+                worker.ID, maxRetries, err)
+            c.handleWorkerFailure(task, worker)
+            return
+        }
+
+        time.Sleep(time.Second)
     }
-    
-    client := rpc.NewClient(conn)
     defer client.Close()
 
     var resp types.ComputeResponse
     err = client.Call("Worker.ExecuteTask", task, &resp)
     if err != nil {
-        log.Printf("Error executing task on worker %s: %v\n", worker.ID, err)
+        log.Printf("[ERROR] Error executing task on worker %s: %v\n", worker.ID, err)
         c.handleWorkerFailure(task, worker)
         return
     }
@@ -223,6 +293,11 @@ func (c *CoordinatorService) assignTaskToWorker(task *types.Task, worker *types.
         task.Completed = resp.Success
         task.Error = resp.Error
         delete(c.taskAssignments, task.ID)
+        
+        if c.verbose {
+            log.Printf("[DEBUG] Task %s completed by worker %s: success=%v, error=%s\n",
+                task.ID, worker.ID, resp.Success, resp.Error)
+        }
     }
 }
 
@@ -235,9 +310,10 @@ func (c *CoordinatorService) handleWorkerFailure(task *types.Task, worker *types
     if c.retryCount[task.ID] < maxRetries {
         c.taskQueue = append(c.taskQueue, task.ID)
         c.retryCount[task.ID]++
-        log.Printf("Reassigning task %s (attempt %d/%d)", task.ID, c.retryCount[task.ID], maxRetries)
+        log.Printf("[INFO] Reassigning task %s (attempt %d/%d)\n", 
+            task.ID, c.retryCount[task.ID], maxRetries)
     } else {
-        log.Printf("Task %s failed after %d attempts", task.ID, maxRetries)
+        log.Printf("[ERROR] Task %s failed after %d attempts\n", task.ID, maxRetries)
         task.Error = "maximum retry attempts exceeded"
         task.Completed = true
     }
@@ -245,15 +321,16 @@ func (c *CoordinatorService) handleWorkerFailure(task *types.Task, worker *types
 
 func main() {
     useTLS := flag.Bool("tls", false, "Use TLS for secure communication")
+    verbose := flag.Bool("v", false, "Enable verbose logging")
     flag.Parse()
 
-    coordinator := NewCoordinator()
+    coordinator := NewCoordinator(*verbose)
 
     // Register RPC service
     server := rpc.NewServer()
     err := server.RegisterName("Coordinator", coordinator)
     if err != nil {
-        log.Fatal("Failed to register RPC server:", err)
+        log.Fatal("[FATAL] Failed to register RPC server:", err)
     }
 
     var listener net.Listener
@@ -261,7 +338,7 @@ func main() {
         // Generate TLS certificate
         cert, err := tlsutil.GenerateCertificate("localhost")
         if err != nil {
-            log.Fatal("Failed to generate TLS certificate:", err)
+            log.Fatal("[FATAL] Failed to generate TLS certificate:", err)
         }
 
         // Create TLS configuration
@@ -273,22 +350,22 @@ func main() {
         // Start TLS listener
         listener, err = tls.Listen("tcp", ":1234", config)
         if err != nil {
-            log.Fatal("Failed to start TLS listener:", err)
+            log.Fatal("[FATAL] Failed to start TLS listener:", err)
         }
-        log.Println("Coordinator started with TLS on :1234")
+        log.Println("[INFO] Coordinator started with TLS on :1234")
     } else {
         listener, err = net.Listen("tcp", ":1234")
         if err != nil {
-            log.Fatal("Failed to start listener:", err)
+            log.Fatal("[FATAL] Failed to start listener:", err)
         }
-        log.Println("Coordinator started on :1234")
+        log.Println("[INFO] Coordinator started on :1234")
     }
 
     // Accept connections
     for {
         conn, err := listener.Accept()
         if err != nil {
-            log.Println("Accept error:", err)
+            log.Println("[ERROR] Accept error:", err)
             continue
         }
         go server.ServeConn(conn)

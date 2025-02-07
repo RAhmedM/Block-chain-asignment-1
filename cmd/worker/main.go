@@ -22,11 +22,45 @@ type Worker struct {
     client    *rpc.Client
 }
 
+
 // ExecuteTask performs the requested matrix operation
 func (w *Worker) ExecuteTask(task *types.Task, resp *types.ComputeResponse) error {
-    log.Printf("Worker %s received task %s\n", w.ID, task.ID)
+    log.Printf("\n=== Worker %s processing task %s ===\n", w.ID, task.ID)
+    log.Printf("Operation type: %d\n", task.Op)
+
+    // Validate input matrices
+    if task.Matrix1 == nil {
+        resp.Error = "first matrix is nil"
+        resp.Success = false
+        return nil
+    }
+
+    if task.Matrix1.Rows <= 0 || task.Matrix1.Cols <= 0 {
+        resp.Error = "invalid matrix dimensions"
+        resp.Success = false
+        return nil
+    }
+
+    if task.Op != types.Transpose {
+        if task.Matrix2 == nil {
+            resp.Error = "second matrix is required for this operation"
+            resp.Success = false
+            return nil
+        }
+        if task.Matrix2.Rows <= 0 || task.Matrix2.Cols <= 0 {
+            resp.Error = "invalid second matrix dimensions"
+            resp.Success = false
+            return nil
+        }
+    }
+
     var err error
     resp.TaskID = task.ID
+
+    log.Printf("\nInput Matrix:\n%s", task.Matrix1)
+    if task.Matrix2 != nil {
+        log.Printf("Second Matrix:\n%s", task.Matrix2)
+    }
 
     switch task.Op {
     case types.Addition:
@@ -35,6 +69,8 @@ func (w *Worker) ExecuteTask(task *types.Task, resp *types.ComputeResponse) erro
         resp.Result, err = w.Transpose(task.Matrix1)
     case types.Multiplication:
         resp.Result, err = w.Multiply(task.Matrix1, task.Matrix2)
+    default:
+        err = fmt.Errorf("unsupported operation: %d", task.Op)
     }
 
     if err != nil {
@@ -45,7 +81,8 @@ func (w *Worker) ExecuteTask(task *types.Task, resp *types.ComputeResponse) erro
 
     w.taskCount++
     resp.Success = true
-    log.Printf("Worker %s completed task %s\n", w.ID, task.ID)
+    log.Printf("Task %s completed successfully\n", task.ID)
+    log.Printf("=== End of task processing ===\n")
 
     // Update coordinator about our status
     w.reportStatus()
@@ -82,19 +119,26 @@ func (w *Worker) startHealthReporting() {
 // Matrix operation implementations
 func (w *Worker) Add(m1, m2 *matrix.Matrix) (*matrix.Matrix, error) {
     if m1.Rows != m2.Rows || m1.Cols != m2.Cols {
-        return nil, types.MatrixError("invalid dimensions for addition")
+        return nil, fmt.Errorf("matrix dimensions do not match for addition: (%dx%d) and (%dx%d)",
+            m1.Rows, m1.Cols, m2.Rows, m2.Cols)
     }
 
     result, err := matrix.NewMatrix(m1.Rows, m1.Cols)
     if err != nil {
-        return nil, err
+        return nil, fmt.Errorf("failed to create result matrix: %v", err)
     }
 
     for i := 0; i < m1.Rows; i++ {
         for j := 0; j < m1.Cols; j++ {
-            val1, _ := m1.Get(i, j)
-            val2, _ := m2.Get(i, j)
-            result.Set(i, j, val1+val2)
+            val1, err1 := m1.Get(i, j)
+            val2, err2 := m2.Get(i, j)
+            if err1 != nil || err2 != nil {
+                return nil, fmt.Errorf("error accessing matrix elements: %v, %v", err1, err2)
+            }
+            err = result.Set(i, j, val1+val2)
+            if err != nil {
+                return nil, fmt.Errorf("error setting result matrix element: %v", err)
+            }
         }
     }
 
@@ -102,15 +146,25 @@ func (w *Worker) Add(m1, m2 *matrix.Matrix) (*matrix.Matrix, error) {
 }
 
 func (w *Worker) Transpose(m *matrix.Matrix) (*matrix.Matrix, error) {
+    if m == nil {
+        return nil, fmt.Errorf("cannot transpose nil matrix")
+    }
+
     result, err := matrix.NewMatrix(m.Cols, m.Rows)
     if err != nil {
-        return nil, err
+        return nil, fmt.Errorf("failed to create result matrix: %v", err)
     }
 
     for i := 0; i < m.Rows; i++ {
         for j := 0; j < m.Cols; j++ {
-            val, _ := m.Get(i, j)
-            result.Set(j, i, val)
+            val, err := m.Get(i, j)
+            if err != nil {
+                return nil, fmt.Errorf("error accessing matrix element: %v", err)
+            }
+            err = result.Set(j, i, val)
+            if err != nil {
+                return nil, fmt.Errorf("error setting result matrix element: %v", err)
+            }
         }
     }
 
@@ -119,23 +173,30 @@ func (w *Worker) Transpose(m *matrix.Matrix) (*matrix.Matrix, error) {
 
 func (w *Worker) Multiply(m1, m2 *matrix.Matrix) (*matrix.Matrix, error) {
     if m1.Cols != m2.Rows {
-        return nil, types.MatrixError("invalid dimensions for multiplication")
+        return nil, fmt.Errorf("invalid dimensions for multiplication: (%dx%d) and (%dx%d)",
+            m1.Rows, m1.Cols, m2.Rows, m2.Cols)
     }
 
     result, err := matrix.NewMatrix(m1.Rows, m2.Cols)
     if err != nil {
-        return nil, err
+        return nil, fmt.Errorf("failed to create result matrix: %v", err)
     }
 
     for i := 0; i < m1.Rows; i++ {
         for j := 0; j < m2.Cols; j++ {
             sum := 0.0
             for k := 0; k < m1.Cols; k++ {
-                val1, _ := m1.Get(i, k)
-                val2, _ := m2.Get(k, j)
+                val1, err1 := m1.Get(i, k)
+                val2, err2 := m2.Get(k, j)
+                if err1 != nil || err2 != nil {
+                    return nil, fmt.Errorf("error accessing matrix elements: %v, %v", err1, err2)
+                }
                 sum += val1 * val2
             }
-            result.Set(i, j, sum)
+            err = result.Set(i, j, sum)
+            if err != nil {
+                return nil, fmt.Errorf("error setting result matrix element: %v", err)
+            }
         }
     }
 
