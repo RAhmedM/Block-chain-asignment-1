@@ -3,11 +3,13 @@
 package main
 
 import (
+    "crypto/tls"
     "flag"
     "fmt"
     "log"
     "matrix-compute/pkg/matrix"
     "matrix-compute/pkg/types"
+    tlsutil "matrix-compute/pkg/tls"
     "net"
     "net/rpc"
     "time"
@@ -17,6 +19,7 @@ import (
 type Worker struct {
     ID        string
     taskCount int
+    client    *rpc.Client
 }
 
 // ExecuteTask performs the requested matrix operation
@@ -43,19 +46,40 @@ func (w *Worker) ExecuteTask(task *types.Task, resp *types.ComputeResponse) erro
     w.taskCount++
     resp.Success = true
     log.Printf("Worker %s completed task %s\n", w.ID, task.ID)
+
+    // Update coordinator about our status
+    w.reportStatus()
+    
     return nil
 }
 
-// GetStatus returns the current status of the worker
-func (w *Worker) GetStatus(_ *struct{}, status *types.WorkerStatus) error {
-    status.ID = w.ID
-    status.Available = true
-    status.TaskCount = w.taskCount
-    status.LastUpdated = time.Now().Unix()
-    return nil
+// reportStatus sends the current worker status to the coordinator
+func (w *Worker) reportStatus() {
+    status := &types.WorkerStatus{
+        ID:          w.ID,
+        Available:   true,
+        TaskCount:   w.taskCount,
+        LastUpdated: time.Now().Unix(),
+    }
+
+    var reply bool
+    err := w.client.Call("Coordinator.UpdateWorkerStatus", status, &reply)
+    if err != nil {
+        log.Printf("Failed to update coordinator: %v\n", err)
+    }
 }
 
-// Add performs matrix addition
+// startHealthReporting periodically sends health updates to coordinator
+func (w *Worker) startHealthReporting() {
+    ticker := time.NewTicker(5 * time.Second)
+    go func() {
+        for range ticker.C {
+            w.reportStatus()
+        }
+    }()
+}
+
+// Matrix operation implementations
 func (w *Worker) Add(m1, m2 *matrix.Matrix) (*matrix.Matrix, error) {
     if m1.Rows != m2.Rows || m1.Cols != m2.Cols {
         return nil, types.MatrixError("invalid dimensions for addition")
@@ -77,7 +101,6 @@ func (w *Worker) Add(m1, m2 *matrix.Matrix) (*matrix.Matrix, error) {
     return result, nil
 }
 
-// Transpose performs matrix transposition
 func (w *Worker) Transpose(m *matrix.Matrix) (*matrix.Matrix, error) {
     result, err := matrix.NewMatrix(m.Cols, m.Rows)
     if err != nil {
@@ -94,7 +117,6 @@ func (w *Worker) Transpose(m *matrix.Matrix) (*matrix.Matrix, error) {
     return result, nil
 }
 
-// Multiply performs matrix multiplication
 func (w *Worker) Multiply(m1, m2 *matrix.Matrix) (*matrix.Matrix, error) {
     if m1.Cols != m2.Rows {
         return nil, types.MatrixError("invalid dimensions for multiplication")
@@ -120,10 +142,12 @@ func (w *Worker) Multiply(m1, m2 *matrix.Matrix) (*matrix.Matrix, error) {
     return result, nil
 }
 
+
 func main() {
     // Command line flags for worker configuration
     port := flag.Int("port", 0, "Port to listen on (0 for random)")
     coordinatorAddr := flag.String("coordinator", "localhost:1234", "Coordinator address")
+    useTLS := flag.Bool("tls", false, "Use TLS for secure communication")
     flag.Parse()
 
     // Create worker instance
@@ -131,15 +155,38 @@ func main() {
 
     // Register RPC service
     server := rpc.NewServer()
-    err := server.Register(worker)
+    err := server.RegisterName("Worker", worker)
     if err != nil {
         log.Fatal("Failed to register worker:", err)
     }
 
-    // Start listening for coordinator connections
-    listener, err := net.Listen("tcp", fmt.Sprintf(":%d", *port))
-    if err != nil {
-        log.Fatal("Failed to start listener:", err)
+    var listener net.Listener
+    var tlsCert tls.Certificate
+    
+    if *useTLS {
+        // Generate TLS certificate
+        var err error
+        tlsCert, err = tlsutil.GenerateCertificate("localhost")
+        if err != nil {
+            log.Fatal("Failed to generate TLS certificate:", err)
+        }
+
+        // Create TLS configuration for listener
+        config := &tls.Config{
+            Certificates: []tls.Certificate{tlsCert},
+            InsecureSkipVerify: true, // For self-signed certificates
+        }
+
+        // Start TLS listener
+        listener, err = tls.Listen("tcp", fmt.Sprintf(":%d", *port), config)
+        if err != nil {
+            log.Fatal("Failed to start TLS listener:", err)
+        }
+    } else {
+        listener, err = net.Listen("tcp", fmt.Sprintf(":%d", *port))
+        if err != nil {
+            log.Fatal("Failed to start listener:", err)
+        }
     }
 
     // Get the actual address we're listening on
@@ -148,13 +195,26 @@ func main() {
 
     log.Printf("Worker started on %s\n", worker.ID)
 
-    // Register with coordinator
-    client, err := rpc.Dial("tcp", *coordinatorAddr)
-    if err != nil {
-        log.Fatal("Failed to connect to coordinator:", err)
+    // Connect to coordinator
+    var coordinatorClient *rpc.Client
+    if *useTLS {
+        config := &tls.Config{
+            InsecureSkipVerify: true, // For self-signed certificates
+        }
+        conn, err := tls.Dial("tcp", *coordinatorAddr, config)
+        if err != nil {
+            log.Fatal("Failed to connect to coordinator:", err)
+        }
+        coordinatorClient = rpc.NewClient(conn)
+    } else {
+        coordinatorClient, err = rpc.Dial("tcp", *coordinatorAddr)
+        if err != nil {
+            log.Fatal("Failed to connect to coordinator:", err)
+        }
     }
+    worker.client = coordinatorClient
 
-    // Create and send worker status
+    // Register with coordinator
     status := &types.WorkerStatus{
         ID:          worker.ID,
         Available:   true,
@@ -163,17 +223,19 @@ func main() {
     }
 
     var reply bool
-    err = client.Call("Coordinator.RegisterWorker", status, &reply)
+    err = coordinatorClient.Call("Coordinator.RegisterWorker", status, &reply)
     if err != nil {
         log.Fatal("Failed to register with coordinator:", err)
     }
-    client.Close()
 
     if !reply {
         log.Fatal("Coordinator rejected worker registration")
     }
 
     log.Printf("Successfully registered with coordinator")
+
+    // Start health reporting
+    worker.startHealthReporting()
 
     // Start serving requests
     for {

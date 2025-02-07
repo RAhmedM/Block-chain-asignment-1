@@ -3,6 +3,8 @@
 package main
 
 import (
+    "crypto/tls"
+    "flag"
     "fmt"
     "log"
     "matrix-compute/pkg/matrix"
@@ -12,10 +14,29 @@ import (
 )
 
 func main() {
+    // Command line flags
+    coordinatorAddr := flag.String("coordinator", "localhost:1234", "Coordinator address")
+    useTLS := flag.Bool("tls", false, "Use TLS for secure communication")
+    flag.Parse()
+
     // Connect to the coordinator
-    client, err := rpc.Dial("tcp", "localhost:1234")
-    if err != nil {
-        log.Fatal("Failed to connect to coordinator:", err)
+    var client *rpc.Client
+    var err error
+
+    if *useTLS {
+        config := &tls.Config{
+            InsecureSkipVerify: true, // For self-signed certificates
+        }
+        conn, err := tls.Dial("tcp", *coordinatorAddr, config)
+        if err != nil {
+            log.Fatal("Failed to connect to coordinator:", err)
+        }
+        client = rpc.NewClient(conn)
+    } else {
+        client, err = rpc.Dial("tcp", *coordinatorAddr)
+        if err != nil {
+            log.Fatal("Failed to connect to coordinator:", err)
+        }
     }
     defer client.Close()
 
