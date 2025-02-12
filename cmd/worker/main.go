@@ -206,7 +206,9 @@ func (w *Worker) Multiply(m1, m2 *matrix.Matrix) (*matrix.Matrix, error) {
 // In cmd/worker/main.go
 
 func main() {
-    port := flag.Int("port", 0, "Port to listen on (0 for random)")
+    // Add new flag for worker's external address
+    port := flag.Int("port", 0, "Port to listen on")
+    externalHost := flag.String("host", "localhost", "External hostname or IP address")
     coordinatorAddr := flag.String("coordinator", "localhost:1234", "Coordinator address")
     useTLS := flag.Bool("tls", false, "Use TLS for secure communication")
     flag.Parse()
@@ -225,37 +227,35 @@ func main() {
     var tlsCert tls.Certificate
     
     if *useTLS {
-        // Generate TLS certificate
+        // Generate TLS certificate with the external hostname
         var err error
-        tlsCert, err = tlsutil.GenerateCertificate("localhost")
+        tlsCert, err = tlsutil.GenerateCertificate(*externalHost)
         if err != nil {
             log.Fatal("Failed to generate TLS certificate:", err)
         }
 
-        // Create TLS configuration for listener with updated settings
+        // Create TLS configuration for listener
         config := &tls.Config{
             Certificates:       []tls.Certificate{tlsCert},
             InsecureSkipVerify: true,
-            ClientAuth:         tls.NoClientCert,  // Changed this
+            ClientAuth:         tls.NoClientCert,
             MinVersion:         tls.VersionTLS12,
         }
 
-        // Start TLS listener
-        listener, err = tls.Listen("tcp", fmt.Sprintf(":%d", *port), config)
+        // Listen on all interfaces (0.0.0.0) for remote connections
+        listener, err = tls.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", *port), config)
         if err != nil {
             log.Fatal("Failed to start TLS listener:", err)
         }
     } else {
-        listener, err = net.Listen("tcp", fmt.Sprintf(":%d", *port))
+        listener, err = net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", *port))
         if err != nil {
             log.Fatal("Failed to start listener:", err)
         }
     }
 
-    // Get the actual address we're listening on
-    addr := listener.Addr().(*net.TCPAddr)
-    worker.ID = fmt.Sprintf("localhost:%d", addr.Port)
-
+    // Use the external host for the worker ID
+    worker.ID = fmt.Sprintf("%s:%d", *externalHost, *port)
     log.Printf("Worker started on %s with TLS=%v\n", worker.ID, *useTLS)
 
     // Connect to coordinator with TLS
@@ -296,12 +296,12 @@ func main() {
         log.Fatal("Coordinator rejected worker registration")
     }
 
-    log.Printf("Successfully registered with coordinator")
+    log.Printf("Successfully registered with coordinator at %s", *coordinatorAddr)
 
     // Start health reporting
     worker.startHealthReporting()
 
-    // Custom connection handler for better error logging
+    // Handle connections
     for {
         conn, err := listener.Accept()
         if err != nil {

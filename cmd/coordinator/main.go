@@ -8,6 +8,7 @@ import (
     "log"
     "matrix-compute/pkg/types"
     tlsutil "matrix-compute/pkg/tls"
+    "fmt"
     "net"
     "net/rpc"
     "sync"
@@ -336,6 +337,7 @@ func (c *CoordinatorService) handleWorkerFailure(task *types.Task, worker *types
 func main() {
     useTLS := flag.Bool("tls", false, "Use TLS for secure communication")
     verbose := flag.Bool("v", false, "Enable verbose logging")
+    host := flag.String("host", "0.0.0.0", "Host address to listen on")
     flag.Parse()
 
     var cert tls.Certificate
@@ -343,7 +345,7 @@ func main() {
 
     if *useTLS {
         // Generate TLS certificate
-        cert, err = tlsutil.GenerateCertificate("localhost")
+        cert, err = tlsutil.GenerateCertificate(*host) // Use the host parameter
         if err != nil {
             log.Fatal("[FATAL] Failed to generate TLS certificate:", err)
         }
@@ -368,19 +370,20 @@ func main() {
             InsecureSkipVerify: true,
         }
 
-        // Start TLS listener
-        listener, err = tls.Listen("tcp", ":1234", config)
+        // Start TLS listener on specified host
+        listener, err = tls.Listen("tcp", fmt.Sprintf("%s:1234", *host), config)
         if err != nil {
             log.Fatal("[FATAL] Failed to start TLS listener:", err)
         }
-        log.Println("[INFO] Coordinator started with TLS on :1234")
+        log.Printf("[INFO] Coordinator started with TLS on %s:1234\n", *host)
     } else {
-        listener, err = net.Listen("tcp", ":1234")
+        listener, err = net.Listen("tcp", fmt.Sprintf("%s:1234", *host))
         if err != nil {
             log.Fatal("[FATAL] Failed to start listener:", err)
         }
-        log.Println("[INFO] Coordinator started on :1234")
+        log.Printf("[INFO] Coordinator started on %s:1234\n", *host)
     }
+
 
     // Accept connections
     for {
