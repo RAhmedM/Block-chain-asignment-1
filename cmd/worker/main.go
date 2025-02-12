@@ -203,9 +203,9 @@ func (w *Worker) Multiply(m1, m2 *matrix.Matrix) (*matrix.Matrix, error) {
     return result, nil
 }
 
+// In cmd/worker/main.go
 
 func main() {
-    // Command line flags for worker configuration
     port := flag.Int("port", 0, "Port to listen on (0 for random)")
     coordinatorAddr := flag.String("coordinator", "localhost:1234", "Coordinator address")
     useTLS := flag.Bool("tls", false, "Use TLS for secure communication")
@@ -232,10 +232,12 @@ func main() {
             log.Fatal("Failed to generate TLS certificate:", err)
         }
 
-        // Create TLS configuration for listener
+        // Create TLS configuration for listener with updated settings
         config := &tls.Config{
-            Certificates: []tls.Certificate{tlsCert},
-            InsecureSkipVerify: true, // For self-signed certificates
+            Certificates:       []tls.Certificate{tlsCert},
+            InsecureSkipVerify: true,
+            ClientAuth:         tls.NoClientCert,  // Changed this
+            MinVersion:         tls.VersionTLS12,
         }
 
         // Start TLS listener
@@ -254,13 +256,14 @@ func main() {
     addr := listener.Addr().(*net.TCPAddr)
     worker.ID = fmt.Sprintf("localhost:%d", addr.Port)
 
-    log.Printf("Worker started on %s\n", worker.ID)
+    log.Printf("Worker started on %s with TLS=%v\n", worker.ID, *useTLS)
 
-    // Connect to coordinator
+    // Connect to coordinator with TLS
     var coordinatorClient *rpc.Client
     if *useTLS {
         config := &tls.Config{
-            InsecureSkipVerify: true, // For self-signed certificates
+            InsecureSkipVerify: true,
+            Certificates:       []tls.Certificate{tlsCert},
         }
         conn, err := tls.Dial("tcp", *coordinatorAddr, config)
         if err != nil {
@@ -298,13 +301,27 @@ func main() {
     // Start health reporting
     worker.startHealthReporting()
 
-    // Start serving requests
+    // Custom connection handler for better error logging
     for {
         conn, err := listener.Accept()
         if err != nil {
-            log.Println("Accept error:", err)
+            log.Printf("Accept error: %v\n", err)
             continue
         }
-        go server.ServeConn(conn)
+
+        go func(conn net.Conn) {
+            defer conn.Close()
+            
+            if *useTLS {
+                tlsConn := conn.(*tls.Conn)
+                if err := tlsConn.Handshake(); err != nil {
+                    log.Printf("TLS handshake failed: %v\n", err)
+                    return
+                }
+                log.Printf("TLS handshake successful with %s\n", tlsConn.RemoteAddr())
+            }
+            
+            server.ServeConn(conn)
+        }(conn)
     }
 }

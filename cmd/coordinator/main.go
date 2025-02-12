@@ -29,10 +29,12 @@ type CoordinatorService struct {
     taskAssignments map[string]string // taskID -> workerID
     mu             sync.Mutex
     verbose        bool
+    tlsCert        tls.Certificate    // Add this field
 }
 
+
 // NewCoordinator creates a new coordinator instance
-func NewCoordinator(verbose bool) *CoordinatorService {
+func NewCoordinator(verbose bool, cert tls.Certificate) *CoordinatorService {
     c := &CoordinatorService{
         tasks:           make(map[string]*types.Task),
         workers:         make(map[string]*types.WorkerStatus),
@@ -40,6 +42,7 @@ func NewCoordinator(verbose bool) *CoordinatorService {
         retryCount:      make(map[string]int),
         taskAssignments: make(map[string]string),
         verbose:         verbose,
+        tlsCert:        cert,           // Initialize the certificate
     }
     go c.processTaskQueue()
     go c.monitorWorkerHealth()
@@ -245,6 +248,7 @@ func (c *CoordinatorService) processTaskQueue() {
     }
 }
 
+
 // assignTaskToWorker sends a task to a worker and handles the response
 func (c *CoordinatorService) assignTaskToWorker(task *types.Task, worker *types.WorkerStatus) {
     if c.verbose {
@@ -261,10 +265,19 @@ func (c *CoordinatorService) assignTaskToWorker(task *types.Task, worker *types.
             log.Printf("[DEBUG] Connection attempt %d to worker %s\n", attempt, worker.ID)
         }
 
-        client, err = rpc.Dial("tcp", worker.ID)
-        if err == nil {
+        // Create TLS configuration for client
+        config := &tls.Config{
+            InsecureSkipVerify: true,
+            Certificates:       []tls.Certificate{c.tlsCert}, // Add this field to CoordinatorService
+        }
+
+        // Connect with TLS
+        conn, dialErr := tls.Dial("tcp", worker.ID, config)
+        if dialErr == nil {
+            client = rpc.NewClient(conn)
             break
         }
+        err = dialErr
 
         if attempt == maxRetries {
             log.Printf("[ERROR] Failed to connect to worker %s after %d attempts: %v\n", 
@@ -301,6 +314,7 @@ func (c *CoordinatorService) assignTaskToWorker(task *types.Task, worker *types.
     }
 }
 
+
 // handleWorkerFailure handles worker failures and task reassignment
 func (c *CoordinatorService) handleWorkerFailure(task *types.Task, worker *types.WorkerStatus) {
     c.mu.Lock()
@@ -324,27 +338,34 @@ func main() {
     verbose := flag.Bool("v", false, "Enable verbose logging")
     flag.Parse()
 
-    coordinator := NewCoordinator(*verbose)
+    var cert tls.Certificate
+    var err error
+
+    if *useTLS {
+        // Generate TLS certificate
+        cert, err = tlsutil.GenerateCertificate("localhost")
+        if err != nil {
+            log.Fatal("[FATAL] Failed to generate TLS certificate:", err)
+        }
+    }
+
+    coordinator := NewCoordinator(*verbose, cert)
 
     // Register RPC service
     server := rpc.NewServer()
-    err := server.RegisterName("Coordinator", coordinator)
+    err = server.RegisterName("Coordinator", coordinator)
     if err != nil {
         log.Fatal("[FATAL] Failed to register RPC server:", err)
     }
 
     var listener net.Listener
     if *useTLS {
-        // Generate TLS certificate
-        cert, err := tlsutil.GenerateCertificate("localhost")
-        if err != nil {
-            log.Fatal("[FATAL] Failed to generate TLS certificate:", err)
-        }
-
         // Create TLS configuration
         config := &tls.Config{
             Certificates: []tls.Certificate{cert},
-            InsecureSkipVerify: true, // For self-signed certificates
+            ClientAuth: tls.NoClientCert,
+            MinVersion: tls.VersionTLS12,
+            InsecureSkipVerify: true,
         }
 
         // Start TLS listener
@@ -368,6 +389,19 @@ func main() {
             log.Println("[ERROR] Accept error:", err)
             continue
         }
+
+        if *useTLS {
+            tlsConn := conn.(*tls.Conn)
+            if err := tlsConn.Handshake(); err != nil {
+                log.Printf("[ERROR] TLS handshake failed: %v\n", err)
+                conn.Close()
+                continue
+            }
+            if verbose != nil && *verbose {
+                log.Printf("[DEBUG] TLS handshake successful with %s\n", tlsConn.RemoteAddr())
+            }
+        }
+
         go server.ServeConn(conn)
     }
 }
